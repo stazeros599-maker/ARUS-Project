@@ -1,0 +1,116 @@
+import cv2
+import json
+import time  # 1. Imported time to handle the message rate
+import paho.mqtt.client as mqtt
+from ultralytics import YOLO
+
+# --- CONFIGURATION ---
+MQTT_BROKER = "192.168.0.197" 
+MQTT_TOPIC = "robot/vision"
+TRASH_IDS = [39, 41, 45, 67, 43, 44, 21, 24, 27, 76, 54] 
+TARGET_CLASSES = [0] + TRASH_IDS 
+
+# --- MQTT SETUP ---
+client = mqtt.Client(callback_api_version=mqtt.CallbackAPIVersion.VERSION2)
+try:
+    client.connect(MQTT_BROKER, 1883, 60)
+    print(f"✅ Connected to MQTT Broker: {MQTT_BROKER}")
+except Exception as e:
+    print(f"❌ MQTT Offline: {e}")
+
+# --- YOLO & CAMERA SETUP ---
+print("Loading YOLO model...")
+model = YOLO("yolo11n.pt") 
+
+USER, PASS, IP = "ARUS2026", "arus_robot", "192.168.0.200" 
+url = f"rtsp://{USER}:{PASS}@{IP}:554/stream2"
+
+print(f"Connecting to RTSP Stream...")
+cap = cv2.VideoCapture(url)
+
+cap.set(cv2.CAP_PROP_BUFFERSIZE, 1) 
+
+frame_counter = 0
+
+# 2. Timing Trackers
+last_msg_time = 0
+msg_interval = 0.5  # Send a message every 0.5 seconds (500ms) maximum
+
+active_boxes = []
+
+while cap.isOpened():
+    ret, img = cap.read()
+    if not ret or img is None:
+        break
+
+    frame_counter += 1
+
+    h, w, _ = img.shape
+    left_boundary = w // 3
+    right_boundary = (2 * w) // 3
+    
+    display_img = img.copy()
+
+    if frame_counter % 3 == 0:
+        active_boxes = [] 
+        
+        img_resized = cv2.resize(img, (320, 320))
+        results = model(img_resized, classes=TARGET_CLASSES, verbose=False, device="cpu")
+
+        for r in results:
+            for box in r.boxes:
+                conf = float(box.conf[0])
+                if conf > 0.25:
+                    class_id = int(box.cls[0])
+                    item_name = model.names[class_id]
+                    
+                    x1_res, y1_res, x2_res, y2_res = map(int, box.xyxy[0])
+                    x1 = int(x1_res * (w / 320))
+                    y1 = int(y1_res * (h / 320))
+                    x2 = int(x2_res * (w / 320))
+                    y2 = int(y2_res * (h / 320))
+                    
+                    obj_center_x = (x1 + x2) // 2
+                    
+                    if obj_center_x < left_boundary:
+                        zone, color = "LEFT", (255, 100, 0)
+                    elif obj_center_x > right_boundary:
+                        zone, color = "RIGHT", (0, 0, 255)
+                    else:
+                        zone, color = "CENTER", (0, 255, 0)
+
+                    label_type = "TRASH" if class_id in TRASH_IDS else "PERSON"
+                    active_boxes.append((x1, y1, x2, y2, color, f"{label_type}: {item_name}"))
+
+                    # --- TIMER-CONTROLLED MQTT LOGIC ---
+                    if class_id in TRASH_IDS:
+                        current_time = time.time()
+                        
+                        # 3. Check if enough time has passed since the last message
+                        if current_time - last_msg_time >= msg_interval:
+                            payload = json.dumps({"i": item_name, "z": zone})
+                            try:
+                                client.publish(MQTT_TOPIC, payload)
+                                last_msg_time = current_time  # Reset the timer clock
+                                print(f"⏱️ Streaming: {payload}")
+                            except:
+                                pass
+
+    for (x1, y1, x2, y2, color, label) in active_boxes:
+        cv2.rectangle(display_img, (x1, y1), (x2, y2), color, 2)
+        cv2.putText(display_img, label, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+
+    cv2.line(display_img, (left_boundary, 0), (left_boundary, h), (200, 200, 200), 2)
+    cv2.line(display_img, (right_boundary, 0), (right_boundary, h), (200, 200, 200), 2)
+
+    cv2.imshow("ARUS 2026 - Pi Vision", display_img)
+    client.loop(timeout=0.001)
+    if cv2.waitKey(5) & 0xFF == ord('q'):
+        break
+
+cap.release()
+cv2.destroyAllWindows()
+try:
+    client.disconnect()
+except:
+    pass
