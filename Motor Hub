@@ -1,0 +1,452 @@
+// motor, industrial distance, camera, buzzer + OTA
+#include <WiFi.h>
+#include <PubSubClient.h>
+#include <ArduinoJson.h>
+#include <ArduinoOTA.h>
+
+/* ---------------- PIN DEFINITIONS ---------------- */
+#define BUZZER_PIN       15
+
+// Industrial RS485 Sensor Pins (Remapped from 26/27 to avoid motor conflict)
+#define RXD2_PIN         32
+#define TXD2_PIN         33
+
+// Original PWM motor pins 
+#define DIR_PIN_A        26 
+#define DIR_PIN_B        27 
+#define PWM_PIN_A        25 
+#define PWM_PIN_B        14 
+
+// Extra L298N motor driver
+#define L298N_ENA_PIN    18
+#define L298N_IN1_PIN    19
+#define L298N_IN2_PIN    21
+#define L298N_IN3_PIN    22
+#define L298N_IN4_PIN    23
+#define L298N_ENB_PIN    5
+
+/* ---------------- PWM CHANNELS ---------------- */
+#define PWM_A_CH         0
+#define PWM_B_CH         1
+#define L298N_ENA_CH     2
+#define L298N_ENB_CH     3
+#define BUZZER_CH        4
+
+/* ---------------- GLOBAL VARIABLES ---------------- */
+bool isAutoMode = false;
+bool avoidingObstacle = false;
+
+int motorSpeed = 225; 
+int l298nSpeed = 225;
+
+long latestDistance = 0; // Stored in cm
+String currentDirection = "STOP";
+
+// Modbus RTU Command Frame for reading register 0x0100
+const byte readDistanceProcessed[] = {0x01, 0x03, 0x01, 0x00, 0x00, 0x01, 0x85, 0xF6};
+
+/* ---------------- NETWORK CONFIG ---------------- */
+const char* ssid = "TOTOLINK-71ED";
+const char* password = "12345678";
+const char* mqtt_server = "192.168.0.197";
+
+WiFiClient espClient;
+PubSubClient client(espClient);
+
+/* ---------------- PWM SETTINGS ---------------- */
+const int freq = 5000;
+const int resolution = 8;
+
+/* ---------------- BUZZER FUNCTIONS ---------------- */
+void playSuccess() {
+  ledcWriteTone(BUZZER_CH, 1000); delay(150);
+  ledcWriteTone(BUZZER_CH, 1500); delay(150);
+  ledcWriteTone(BUZZER_CH, 2000); delay(150);
+  ledcWriteTone(BUZZER_CH, 0);    
+}
+
+void playFailed() {
+  ledcWriteTone(BUZZER_CH, 1000);   delay(150);
+  ledcWriteTone(BUZZER_CH, 700);    delay(150);
+  ledcWriteTone(BUZZER_CH, 400);    delay(150);
+  ledcWriteTone(BUZZER_CH, 0);
+}
+
+unsigned long warningStart = 0;
+bool warningActive = false;
+
+void playWarning() {
+  if (!warningActive) {
+    warningActive = true;
+    warningStart = millis();
+  }
+}
+
+/* ---------------- EXTRA L298N MOTOR FUNCTIONS ---------------- */
+void l298nForward() {
+  digitalWrite(L298N_IN1_PIN, HIGH);
+  digitalWrite(L298N_IN2_PIN, LOW);
+
+  digitalWrite(L298N_IN3_PIN, LOW);
+  digitalWrite(L298N_IN4_PIN, HIGH);
+
+  ledcWrite(L298N_ENA_CH, l298nSpeed);
+  ledcWrite(L298N_ENB_CH, l298nSpeed);
+}
+
+void l298nStop() {
+  ledcWrite(L298N_ENA_CH, 0);
+  ledcWrite(L298N_ENB_CH, 0);
+
+  digitalWrite(L298N_IN1_PIN, LOW);
+  digitalWrite(L298N_IN2_PIN, LOW);
+  digitalWrite(L298N_IN3_PIN, LOW);
+  digitalWrite(L298N_IN4_PIN, LOW);
+}
+
+/* ---------------- MAIN PWM MOTOR FUNCTIONS ---------------- */
+void motorMovement(int da, int db, int pa, int pb) {
+  digitalWrite(DIR_PIN_A, da);
+  digitalWrite(DIR_PIN_B, db);
+
+  ledcWrite(PWM_A_CH, pa);
+  ledcWrite(PWM_B_CH, pb);
+
+  l298nForward();
+}
+
+void motorStop() {
+  ledcWrite(PWM_A_CH, 0);
+  ledcWrite(PWM_B_CH, 0);
+
+  l298nStop();
+}
+
+/* ---------------- INDUSTRIAL RS485 SENSOR ---------------- */
+long readUltrasonic() {
+  // Clear RX buffer junk
+  while (Serial2.available()) {
+    Serial2.read();
+  }
+
+  // Write command to Modbus Sensor
+  Serial2.write(readDistanceProcessed, sizeof(readDistanceProcessed));
+  Serial2.flush();
+
+  // Non-blocking response capture (up to 50ms timeout)
+  unsigned long startTime = millis();
+  byte response[20];
+  int index = 0;
+
+  while (millis() - startTime < 50) { 
+    if (Serial2.available()) {
+      response[index] = Serial2.read();
+      index++;
+      if (index >= 20) break;
+    }
+  }
+
+  // Confirm minimal frame size and protocol matches expected response header
+  if (index >= 7 && response[0] == 0x01 && response[1] == 0x03 && response[2] == 0x02) {
+    int distance_mm = (response[3] << 8) | response[4];
+    long distance_cm = distance_mm / 10; // Normalized into cm for your collision threshold logic
+    return distance_cm;
+  }
+
+  return 0; // Return 0 if timed out or failed 
+}
+
+/* ---------------- MQTT CALLBACK ---------------- */
+void callback(char* topic, byte* payload, unsigned int length) {
+  String topicStr = String(topic);
+
+  // Mode switching (Camera / Button)
+  if (topicStr == "robot/mode") {
+    if (length > 0) {
+      isAutoMode = (payload[0] - '0' == 1);
+    }
+
+    motorStop();
+    Serial.println(isAutoMode ? "MODE: AUTO (Camera)" : "MODE: MANUAL (Button)");
+    return;
+  }
+
+  // --- BUTTON CONTROL COMMANDS (robot/control) ---
+  if (topicStr == "robot/control" && !isAutoMode) {
+    String cmd = "";
+    for (unsigned int i = 0; i < length; i++) {
+      cmd += (char)payload[i];
+    }
+    cmd.trim(); 
+
+    Serial.print("From robot/control: ");
+    Serial.println(cmd);
+
+    // Obstacle safety override
+    if (latestDistance > 0 && latestDistance < 55) {
+      if (!avoidingObstacle) {
+        playWarning();
+      }
+      Serial.println("BLOCKED BY OBSTACLE");
+      currentDirection = "AVOIDING";
+      motorMovement(LOW, HIGH, motorSpeed, motorSpeed);
+      avoidingObstacle = true;
+      return;
+    }
+
+    if (cmd == "FORWARD") {
+      currentDirection = "FORWARD";
+      motorMovement(LOW, LOW, motorSpeed, motorSpeed);
+    } 
+    else if (cmd == "BACKWARD") {
+      currentDirection = "BACKWARD";
+      motorMovement(HIGH, HIGH, motorSpeed, motorSpeed);
+    } 
+    else if (cmd == "LEFT") {
+      currentDirection = "LEFT";
+      motorMovement(LOW, LOW, motorSpeed, 0);
+    } 
+    else if (cmd == "RIGHT") {
+      currentDirection = "RIGHT";
+      motorMovement(LOW, LOW, 0, motorSpeed);
+    } 
+    else {
+      currentDirection = "STOP";
+      motorStop();
+    }
+    return;
+  }
+
+  // --- CAMERA CONTROL COMMANDS (via JSON parsing) ---
+  if ((topicStr == "robot/direction/camera" || topicStr == "robot/vision") && isAutoMode) {
+    StaticJsonDocument<200> doc;
+    DeserializationError error = deserializeJson(doc, payload, length);
+
+    if (error) {
+      Serial.println("MQTT JSON parse failed");
+      return;
+    }
+
+    const char* aiCommand = doc["vision"] | "STOP";
+    String vision = String(aiCommand);
+
+    Serial.print("From Camera: ");
+    Serial.println(vision);
+
+    // Obstacle safety override
+    if (latestDistance > 0 && latestDistance < 55) {
+      Serial.println("BLOCKED BY OBSTACLE");
+      currentDirection = "AVOIDING";
+      motorMovement(LOW, HIGH, motorSpeed, motorSpeed);
+      avoidingObstacle = true;
+      return;
+    }
+
+    if (vision == "CENTER") {
+      currentDirection = "FORWARD";
+      motorMovement(LOW, LOW, motorSpeed, motorSpeed);
+    }
+    else if (vision == "SHARP_LEFT") {
+      currentDirection = "SHARP_LEFT";
+      motorMovement(HIGH, LOW, motorSpeed, motorSpeed);
+    }
+    else if (vision == "LEFT") {
+      currentDirection = "LEFT";
+      motorMovement(LOW, LOW, 0, motorSpeed);
+    }
+    else if (vision == "SHARP_RIGHT") {
+      currentDirection = "SHARP_RIGHT";
+      motorMovement(LOW, HIGH, motorSpeed, motorSpeed);
+    }
+    else if (vision == "RIGHT") {
+      currentDirection = "RIGHT";
+      motorMovement(LOW, LOW, motorSpeed, 0);
+    }
+    else {
+      currentDirection = "SEARCHING FOR TRASH. TURNING 360 SHARP RIGHT.";
+      motorMovement(LOW, HIGH, motorSpeed, motorSpeed);
+    }
+  }
+}
+
+/* ---------------- WIFI SETUP ---------------- */
+void connectWiFi() {
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(ssid, password);
+
+  Serial.print("Connecting to WiFi");
+  int wifiTry = 0;
+
+  while (WiFi.status() != WL_CONNECTED && wifiTry < 30) {
+    delay(150);
+    Serial.print(".");
+    wifiTry++;
+  }
+
+  Serial.println();
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("WiFi connected");
+    Serial.print("IP Address: ");
+    Serial.println(WiFi.localIP());
+  } 
+  else {
+    Serial.println("WiFi failed. Restarting ESP32...");
+    delay(500);
+    ESP.restart();
+  }
+}
+
+/* ---------------- OTA SETUP ---------------- */
+void setupOTA() {
+  ArduinoOTA.setHostname("ESP32-Robot");
+  ArduinoOTA.setPassword("12345678");
+
+  ArduinoOTA.onStart([]() {   Serial.println("OTA Upload Started"); });
+  ArduinoOTA.onEnd([]() {     Serial.println("\nOTA Upload Finished"); });
+  ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
+    Serial.printf("OTA Progress: %u%%\r", (progress * 100) / total);
+  });
+  ArduinoOTA.onError([](ota_error_t error) {
+    Serial.printf("OTA Error[%u]: ", error);
+  });
+
+  ArduinoOTA.begin();
+  Serial.println("OTA Ready");
+}
+
+/* ---------------- MQTT RECONNECT ---------------- */
+void reconnect() {
+  if (!client.connected()) {
+    Serial.print("Connecting to MQTT... ");
+
+    String clientId = "ESP32_Robot_Motor_";
+    clientId += String((uint64_t)ESP.getEfuseMac(), HEX);
+
+    if (client.connect(clientId.c_str())) {
+      Serial.println("connected");
+
+      client.subscribe("robot/direction/camera");
+      client.subscribe("robot/vision");
+      client.subscribe("robot/mode");
+      client.subscribe("robot/control"); 
+
+      playSuccess();
+    } 
+    else {
+      Serial.print("failed, rc=");
+      Serial.println(client.state());
+      playFailed();
+      motorStop();
+    }
+  }
+}
+
+/* ---------------- SETUP ---------------- */
+void setup() {
+  Serial.begin(115200);
+  
+  // Initialize Modbus communication line with industrial sensor
+  Serial2.begin(9600, SERIAL_8N1, RXD2_PIN, TXD2_PIN);
+
+  pinMode(DIR_PIN_A, OUTPUT);
+  pinMode(DIR_PIN_B, OUTPUT);
+
+  pinMode(L298N_IN1_PIN, OUTPUT);
+  pinMode(L298N_IN2_PIN, OUTPUT);
+  pinMode(L298N_IN3_PIN, OUTPUT);
+  pinMode(L298N_IN4_PIN, OUTPUT);
+
+  ledcSetup(PWM_A_CH, freq, resolution);
+  ledcSetup(PWM_B_CH, freq, resolution);
+  ledcSetup(L298N_ENA_CH, freq, resolution);
+  ledcSetup(L298N_ENB_CH, freq, resolution);
+  ledcSetup(BUZZER_CH, freq, resolution);
+
+  ledcAttachPin(PWM_PIN_A, PWM_A_CH);
+  ledcAttachPin(PWM_PIN_B, PWM_B_CH);
+  ledcAttachPin(L298N_ENA_PIN, L298N_ENA_CH);
+  ledcAttachPin(L298N_ENB_PIN, L298N_ENB_CH);
+  ledcAttachPin(BUZZER_PIN, BUZZER_CH);
+
+  connectWiFi();
+  setupOTA();
+
+  client.setServer(mqtt_server, 1883);
+  client.setCallback(callback);
+  client.setSocketTimeout(2);
+  client.setKeepAlive(10);
+
+  Serial.println("Setup complete.");
+}
+
+/* ---------------- LOOP ---------------- */
+void loop() {
+  ArduinoOTA.handle();
+
+  if (WiFi.status() != WL_CONNECTED) {
+    motorStop();
+    connectWiFi();
+    setupOTA();
+  }
+
+  if (!client.connected()) {
+    static unsigned long lastReconnect = 0;
+    if (millis() - lastReconnect > 2000) {
+      lastReconnect = millis();
+      reconnect();
+    }
+  }
+
+  client.loop();
+
+  if (warningActive) {
+    unsigned long elapsed = millis() - warningStart;
+    if (elapsed < 80) ledcWriteTone(BUZZER_CH, 1500);
+    else if (elapsed < 160) ledcWriteTone(BUZZER_CH, 0);
+    else if (elapsed < 240) ledcWriteTone(BUZZER_CH, 1500);
+    else if (elapsed < 320) ledcWriteTone(BUZZER_CH, 0);
+    else if (elapsed < 400) ledcWriteTone(BUZZER_CH, 1500);
+    else { ledcWriteTone(BUZZER_CH, 0); warningActive = false; }
+  }
+
+  static unsigned long lastSensorRead = 0;
+  static unsigned long lastPublish = 0;
+  static unsigned long lastSerialPrint = 0;
+
+  // Read industrial Modbus ultrasonic every 150ms
+  if (millis() - lastSensorRead > 150) {
+    lastSensorRead = millis();
+    latestDistance = readUltrasonic();
+
+    if (!avoidingObstacle && latestDistance > 0 && latestDistance < 55) {
+      avoidingObstacle = true;
+      currentDirection = "AVOIDING";
+      motorMovement(LOW, HIGH, motorSpeed, motorSpeed);
+      Serial.println("Auto-Diverting: Sharp Right");
+      playWarning();
+    }
+    else if (avoidingObstacle && (latestDistance >= 55 || latestDistance == 0)) {
+      avoidingObstacle = false;
+      motorStop();
+      currentDirection = "STOP";
+      Serial.println("Obstacle cleared: Stop");
+    }
+  }
+
+  // Publish metrics every 500ms
+  if (millis() - lastPublish >= 500) {
+    lastPublish = millis();
+    client.publish("home/distanceF", String(latestDistance).c_str());
+    client.publish("home/distanceR", String(latestDistance).c_str());
+    client.publish("home/distanceL", String(latestDistance).c_str());
+    client.publish("home/getDirection", currentDirection.c_str());
+  }
+
+  if (millis() - lastSerialPrint > 500) {
+    lastSerialPrint = millis();
+    Serial.print("Distance: ");
+    Serial.print(latestDistance);
+    Serial.println(" cm");
+  }
+}
