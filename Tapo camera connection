@@ -1,8 +1,7 @@
 import os
 # --- NETWORK OPTIMIZATION FOR FFMPEG ---
 # Lower stimeout to 3 seconds and add rw_timeout to aggressively catch drops
-os.environ["OPENCV_FFMPEG_READ_ATTEMPTS"] = str(2**18)
-
+os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;udp|fflags;nobuffer+discardcorrupt|allowed_media_types;video"
 import cv2
 import json
 import time
