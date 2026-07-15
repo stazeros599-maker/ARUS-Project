@@ -1,0 +1,417 @@
+// box temp LM35, I2C LCD module, voltage, humidity&temperature + ArduinoOTA, display direction
+#include <Arduino.h>
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#include <WiFi.h>
+#include <PubSubClient.h>
+#include <ArduinoOTA.h>
+
+// --- PIN DEFINITIONS ---
+#define LM35_PIN         34   // Box temperature sensor LM35
+#define SDA_PIN          21
+#define SCL_PIN          19
+
+#define VOLTAGE_PIN      35   // Voltage sensor
+#define HT_RX            32 
+#define HT_TX            33 
+#define HT_CONTROL       2
+
+HardwareSerial rs485Serial(2);
+
+// --- GLOBAL VARIABLES ---
+float temperature = 0.0;   // RS485 temperature
+float humidity = 0.0;      // RS485 humidity
+String currentDirection = "STOP";
+
+// --- OBJECT INITIALIZATION ---
+LiquidCrystal_I2C lcd(0x27, 16, 3); 
+
+// --- ADC SETTINGS ---
+const float DIVIDER_RATIO = 5.0;   // Voltage sensor divider ratio
+
+// --- NETWORK CONFIG ---
+const char* ssid = "TOTOLINK-71ED";
+const char* password = "12345678";
+const char* mqtt_server = "192.168.0.198";
+
+WiFiClient espClient;
+PubSubClient client(espClient);
+
+void callback(char* topic, byte* payload, unsigned int length) {
+
+  String message = "";
+
+  for (unsigned int i = 0; i < length; i++) {
+    message += (char)payload[i];
+  }
+
+  Serial.print("MQTT [");
+  Serial.print(topic);
+  Serial.print("] ");
+  Serial.println(message);
+
+  if (String(topic) == "home/getDirection") {
+    currentDirection = message;
+  }
+}
+
+// --- MQTT RECONNECT ---
+bool reconnect() {
+  if (!client.connected()) {
+    Serial.print("Attempting MQTT connection...");
+
+    String clientId = "ESP32-Environment-";
+    clientId += String((uint64_t)ESP.getEfuseMac(), HEX);
+
+    if (client.connect(clientId.c_str())) {
+      Serial.println("connected");
+
+      client.subscribe("home/getDirection");
+
+      Serial.println("Subscribed: home/getDirection");
+
+      return true;
+    } else {
+      Serial.print("failed, rc=");
+      Serial.print(client.state());
+      Serial.println(" will try again later");
+      return false;
+    }
+  }
+
+  return true;
+}
+
+// --- OTA SETUP ---
+void setupOTA() {
+  ArduinoOTA.setHostname("ESP32-Environment-Node");
+
+  // Optional OTA password
+  ArduinoOTA.setPassword("12345678");
+
+  ArduinoOTA.onStart([]() {
+    Serial.println("OTA Upload Started");
+
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("OTA Upload");
+    lcd.setCursor(0, 1);
+    lcd.print("Starting...");
+  });
+
+  ArduinoOTA.onEnd([]() {
+    Serial.println("\nOTA Upload Finished");
+
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("OTA Finished");
+    lcd.setCursor(0, 1);
+    lcd.print("Restarting...");
+  });
+
+  ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
+    int percent = (progress * 100) / total;
+
+    Serial.printf("OTA Progress: %u%%\r", percent);
+
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("OTA Progress");
+    lcd.setCursor(0, 1);
+    lcd.print(percent);
+    lcd.print("%");
+  });
+
+  ArduinoOTA.onError([](ota_error_t error) {
+    Serial.printf("OTA Error[%u]: ", error);
+
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("OTA Error");
+
+    if (error == OTA_AUTH_ERROR) {
+      Serial.println("Auth Failed");
+      lcd.setCursor(0, 1);
+      lcd.print("Auth Failed");
+    } 
+    else if (error == OTA_BEGIN_ERROR) {
+      Serial.println("Begin Failed");
+      lcd.setCursor(0, 1);
+      lcd.print("Begin Failed");
+    } 
+    else if (error == OTA_CONNECT_ERROR) {
+      Serial.println("Connect Failed");
+      lcd.setCursor(0, 1);
+      lcd.print("Connect Failed");
+    } 
+    else if (error == OTA_RECEIVE_ERROR) {
+      Serial.println("Receive Failed");
+      lcd.setCursor(0, 1);
+      lcd.print("Receive Failed");
+    } 
+    else if (error == OTA_END_ERROR) {
+      Serial.println("End Failed");
+      lcd.setCursor(0, 1);
+      lcd.print("End Failed");
+    }
+  });
+
+  ArduinoOTA.begin();
+
+  Serial.println("OTA Ready");
+  Serial.print("OTA Hostname: ");
+  Serial.println("ESP32-Environment-Node");
+  Serial.print("OTA IP Address: ");
+  Serial.println(WiFi.localIP());
+
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("OTA Ready");
+  lcd.setCursor(0, 1);
+  lcd.print(WiFi.localIP());
+  delay(2000);
+}
+
+// --- READ RS485 HUMIDITY & TEMPERATURE SENSOR ---
+void readSHT40() {
+  byte query[] = {0x01, 0x04, 0x00, 0x01, 0x00, 0x02, 0x20, 0x0B};
+
+  digitalWrite(HT_CONTROL, HIGH);
+  delay(5);
+
+  rs485Serial.write(query, sizeof(query));
+  rs485Serial.flush();
+
+  delay(5);
+  digitalWrite(HT_CONTROL, LOW);
+
+  delay(200);
+
+  if (rs485Serial.available() >= 9) {
+    byte res[9];
+
+    for (int i = 0; i < 9; i++) {
+      res[i] = rs485Serial.read();
+    }
+
+    temperature = ((res[3] << 8) | res[4]) / 10.0;
+    humidity = ((res[5] << 8) | res[6]) / 10.0;
+
+    Serial.print("RS485 Temp: ");
+    Serial.print(temperature);
+    Serial.print(" C | Humidity: ");
+    Serial.println(humidity);
+  } else {
+    Serial.println("RS485 sensor no response");
+  }
+}
+
+// --- READ LM35 BOX TEMPERATURE ---
+float readBoxTemp() {
+  long sumRaw = 0;
+  long sumMv = 0;
+
+  for (int i = 0; i < 100; i++) {
+    sumRaw += analogRead(LM35_PIN);
+    sumMv += analogReadMilliVolts(LM35_PIN);
+    delay(3);
+  }
+
+  float rawValue = sumRaw / 100.0;
+  float millivolts = sumMv / 100.0;
+
+  // LM35 formula: 10mV = 1°C
+  float boxTemp = millivolts / 10.0;
+
+  Serial.print("LM35 Raw: ");
+  Serial.print(rawValue);
+  Serial.print(" | LM35 mV: ");
+  Serial.print(millivolts);
+  Serial.print(" | Box Temp: ");
+  Serial.print(boxTemp);
+  Serial.println(" C");
+
+  return boxTemp;
+}
+
+// --- READ BATTERY VOLTAGE ---
+float readBatteryVoltage() {
+  long sumMv = 0;
+
+  for (int i = 0; i < 50; i++) {
+    sumMv += analogReadMilliVolts(VOLTAGE_PIN);
+    delay(2);
+  }
+
+  float sensorMv = sumMv / 50.0;
+
+  // Convert sensor output mV to battery voltage
+  float batteryVoltage = (sensorMv / 1000.0) * DIVIDER_RATIO;
+
+  Serial.print("Voltage Sensor mV: ");
+  Serial.print(sensorMv);
+  Serial.print(" | Battery Voltage: ");
+  Serial.println(batteryVoltage);
+
+  return batteryVoltage;
+}
+
+// --- WIFI SETUP ---
+void connectWiFi() {
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(ssid, password);
+
+  Serial.print("Connecting to WiFi");
+
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("Connecting WiFi");
+
+  int timeout_counter = 0;
+
+  while (WiFi.status() != WL_CONNECTED && timeout_counter < 20) {
+    delay(500);
+    Serial.print(".");
+    timeout_counter++;
+  }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\nWiFi Connected!");
+    Serial.print("IP Address: ");
+    Serial.println(WiFi.localIP());
+
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("WiFi Connected");
+    lcd.setCursor(0, 1);
+    lcd.print(WiFi.localIP());
+    delay(3000);
+  } 
+  else {
+    Serial.println("\nWiFi Failed!");
+
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("WiFi Failed!");
+    delay(2000);
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+
+  delay(1000);
+  Serial.println();
+  Serial.println("System starting...");
+
+  // --- I2C LCD ---
+  Wire.begin(SDA_PIN, SCL_PIN);
+
+  lcd.init();
+  lcd.backlight();
+  lcd.clear();
+
+  lcd.setCursor(0, 0);
+  lcd.print("System Starting");
+  lcd.setCursor(0, 1);
+  lcd.print("Please wait...");
+  delay(1500);
+
+  // --- RS485 SENSOR ---
+  rs485Serial.begin(9600, SERIAL_8N1, HT_RX, HT_TX);
+  pinMode(HT_CONTROL, OUTPUT);
+  digitalWrite(HT_CONTROL, LOW);
+
+  // --- ADC SETTINGS ---
+  analogReadResolution(12);
+
+  // For ESP32, ADC_11db is better for analog reading range
+  analogSetPinAttenuation(LM35_PIN, ADC_11db);
+  analogSetPinAttenuation(VOLTAGE_PIN, ADC_11db);
+
+  // --- WIFI ---
+  connectWiFi();
+
+  // --- OTA ---
+  if (WiFi.status() == WL_CONNECTED) {
+    setupOTA();
+  }
+
+  // --- MQTT ---
+  client.setServer(mqtt_server, 1883);
+  client.setCallback(callback);
+  lcd.clear();
+}
+
+void loop() {
+  // --- OTA SERVICE ---
+  ArduinoOTA.handle();
+
+  // --- WIFI CHECK ---
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("WiFi disconnected. Reconnecting...");
+    connectWiFi();
+
+    if (WiFi.status() == WL_CONNECTED) {
+      setupOTA();
+    }
+  }
+
+  // --- MQTT CONNECTION ---
+  static unsigned long lastReconnectAttempt = 0;
+
+  if (!client.connected()) {
+    unsigned long now = millis();
+
+    if (now - lastReconnectAttempt > 5000) {
+      lastReconnectAttempt = now;
+      reconnect();
+    }
+  } else {
+    client.loop();
+  }
+
+  // --- READ SENSOR VALUES ---
+  float boxTemp = readBoxTemp();
+  float batteryVoltage = readBatteryVoltage();
+
+  // --- EVERY 2 SECONDS: READ RS485 + MQTT PUBLISH ---
+  static unsigned long lastLog = 0;
+
+  if (millis() - lastLog > 2000) {
+    lastLog = millis();
+
+    readSHT40();
+
+    if (client.connected()) {
+      client.publish("home/voltage", String(batteryVoltage).c_str());
+      client.publish("home/boxTemp", String(boxTemp, 2).c_str());
+      client.publish("home/envTemp", String(temperature, 2).c_str());
+      client.publish("home/envHum", String(humidity, 2).c_str());
+    }
+  }
+
+  // --- LCD DISPLAY ---
+  lcd.setCursor(0, 0);
+  lcd.print("Box Temp: ");
+  lcd.print(boxTemp, 1);
+  lcd.print((char)223);
+  lcd.print("C   ");
+
+  lcd.setCursor(0, 1);
+  lcd.print("Voltage: ");
+  lcd.print(batteryVoltage, 2);
+  lcd.print("V    ");
+
+  lcd.setCursor(0, 3);
+  lcd.print("Direction: ");
+  lcd.print(currentDirection);
+
+  Serial.print("FINAL => Box Temp: ");
+  Serial.print(boxTemp);
+  Serial.print(" C | Voltage: ");
+  Serial.print(batteryVoltage);
+  Serial.println(" V");
+
+  delay(500);
+}
