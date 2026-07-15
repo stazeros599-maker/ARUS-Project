@@ -252,7 +252,7 @@ void callback(char* topic, byte* payload, unsigned int length) {
     }
     else if (vision == "LEFT") {
       currentDirection = "LEFT";
-      motorMovement(LOW, LOW, 0, motorSpeed);
+      motorMovement(LOW, LOW, motorSpeed, 0);
     }
     else if (vision == "SHARP_RIGHT") {
       currentDirection = "SHARP_RIGHT";
@@ -260,7 +260,7 @@ void callback(char* topic, byte* payload, unsigned int length) {
     }
     else if (vision == "RIGHT") {
       currentDirection = "RIGHT";
-      motorMovement(LOW, LOW, motorSpeed, 0);
+      motorMovement(LOW, LOW, 0, motorSpeed);
     }
     else {
       currentDirection = "SEARCHING FOR TRASH. TURNING 360 SHARP RIGHT.";
