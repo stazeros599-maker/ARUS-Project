@@ -1,0 +1,88 @@
+#define RS485_RX 26
+#define RS485_TX 27
+
+HardwareSerial RS485(2);
+
+const uint8_t requestData[] = {
+  0x01, 0x04, 0x00, 0x01,
+  0x00, 0x02, 0x20, 0x0B
+};
+
+void setup() {
+  Serial.begin(115200);
+  RS485.begin(9600, SERIAL_8N1, RS485_RX, RS485_TX);
+
+  delay(2000);
+  Serial.println("SHT40 RS485 TEST");
+}
+
+void loop() {
+  while (RS485.available()) {
+    RS485.read();
+  }
+
+  Serial.println("TX: 01 04 00 01 00 02 20 0B");
+
+  RS485.write(requestData, sizeof(requestData));
+  RS485.flush();
+
+  uint8_t response[32];
+  int count = 0;
+
+  unsigned long start = millis();
+  unsigned long lastByte = millis();
+
+  while (millis() - start < 1500) {
+    while (RS485.available() && count < 32) {
+      response[count++] = RS485.read();
+      lastByte = millis();
+    }
+
+    if (count > 0 && millis() - lastByte > 30) {
+      break;
+    }
+  }
+
+  Serial.print("RX bytes: ");
+  Serial.println(count);
+
+  if (count == 0) {
+    Serial.println("TIADA RESPONSE");
+  } else {
+    Serial.print("RX: ");
+
+    for (int i = 0; i < count; i++) {
+      if (response[i] < 0x10) Serial.print("0");
+      Serial.print(response[i], HEX);
+      Serial.print(" ");
+    }
+
+    Serial.println();
+
+    if (
+      count >= 9 &&
+      response[0] == 0x01 &&
+      response[1] == 0x04 &&
+      response[2] == 0x04
+    ) {
+      int16_t tempRaw =
+        ((int16_t)response[3] << 8) |
+        response[4];
+
+      uint16_t humRaw =
+        ((uint16_t)response[5] << 8) |
+        response[6];
+
+      Serial.print("Temperature: ");
+      Serial.print(tempRaw / 10.0);
+      Serial.println(" C");
+
+      Serial.print("Humidity: ");
+      Serial.print(humRaw / 10.0);
+      Serial.println(" %RH");
+    }
+  }
+
+  Serial.println("---------------------");
+  delay(2000);
+}
