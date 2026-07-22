@@ -208,7 +208,7 @@ void callback(char* topic, byte* payload, unsigned int length) {
     Serial.println(cmd);
 
     // Obstacle safety override
-    if (latestDistance > 0 && latestDistance < 55) {
+    if (latestDistance > 0 && latestDistance < 65) {
       if (!avoidingObstacle) {
         playWarning();
       }
