@@ -379,6 +379,7 @@ void reconnect() {
       Serial.println(client.state());
       playFailed();
       motorStop();
+      ESP.restart();
     }
   }
 }
