@@ -42,6 +42,7 @@ int motorSpeed = 225;
 int l298nSpeed = 225;
 
 long latestDistance = 999;   // cm, start with safe far value
+long noTrashFound = 0;
 String currentDirection = "STOP";
 
 // Modbus RTU command for IND-A02YY4W
@@ -143,7 +144,7 @@ long readUltrasonic() {
   int index = 0;
 
   // Stable timeout for IND-A02YY4W RS485
-  while (millis() - startTime < 1000) {
+  while (millis() - startTime < 500) {
     if (Serial2.available()) {
       response[index++] = Serial2.read();
       if (index >= 20) break;
@@ -257,7 +258,7 @@ void callback(char* topic, byte* payload, unsigned int length) {
       return;
     }
 
-    const char* aiCommand = doc["vision"] | "STOP";
+    const char* aiCommand = doc["z"] | "STOP";
     String vision = String(aiCommand);
 
     Serial.print("From Camera: ");
@@ -297,8 +298,11 @@ void callback(char* topic, byte* payload, unsigned int length) {
       motorMovement(LOW, LOW, 0, motorSpeed);
     }
     else {
-      currentDirection = "SEARCHING FOR TRASH. TURNING 360 SHARP RIGHT.";
-      motorMovement(LOW, HIGH, motorSpeed, motorSpeed);
+      if(millis()-noTrashFound >= 5000){
+        noTrashFound = millis();
+        currentDirection = "SEARCHING FOR TRASH. TURNING 360 SHARP RIGHT.";
+        motorMovement(LOW, HIGH, motorSpeed, motorSpeed);
+      }
     }
   }
 }
