@@ -175,6 +175,7 @@ bool reconnectMQTT() {
 
   Serial.print("FAILED, state=");
   Serial.println(client.state());
+  ESP.restart();
 
   return false;
 }
