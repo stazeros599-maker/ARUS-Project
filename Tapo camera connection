@@ -1,42 +1,51 @@
-import os
-# --- NETWORK OPTIMIZATION FOR FFMPEG ---
-# Lower stimeout to 3 seconds and add rw_timeout to aggressively catch drops
-os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;udp|fflags;nobuffer+discardcorrupt|allowed_media_types;video"
-import cv2
 import json
-import time
+import os
 import threading
+import time
+import traceback
+
+import cv2
+import numpy as np
 import paho.mqtt.client as mqtt
+from flask import Flask, Response
 from ultralytics import YOLO
 
-# --- CONFIGURATION ---
-MQTT_BROKER = "192.168.0.197" 
-MQTT_TOPIC = "robot/vision"
-TRASH_IDS = {39, 41, 45, 67, 43, 44, 21, 24, 27, 76, 54} 
-TARGET_CLASSES = [0] + list(TRASH_IDS) 
-DISPLAY_WIDTH = 160  # 👈 Adjust this value to make the display window smaller or larger
+# --- NETWORK OPTIMIZATION FOR FFMPEG ---
+os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = (
+    "rtsp_transport;udp|fflags;nobuffer+discardcorrupt|allowed_media_types;video"
+)
 
-# --- THREADED RTSP STREAM & DISPLAY ---
+# --- CONFIGURATION ---
+MQTT_BROKER = "192.168.0.197"
+MQTT_TOPIC = "robot/vision"
+TRASH_IDS = {39, 41, 45, 67, 43, 44, 21, 24, 27, 76, 54}
+# Class 0: Person + Trash IDs
+TARGET_CLASSES = [0] + list(TRASH_IDS)
+STREAM_WIDTH = 640
+
+output_frame = None
+frame_lock = threading.Lock()
+ai_status_msg = "AI Initializing..."
+
+
+# --- THREADED RTSP STREAM ---
 class RTSPStream:
+
     def __init__(self, url):
         self.url = url
         self.cap = None
         self.stopped = False
-        
-        # Shared variable and thread lock
         self.frame = None
         self.lock = threading.Lock()
         self.connect()
-        
+
     def connect(self):
-        """Safely initializes or resets the video capture stream."""
         if self.cap is not None:
             self.cap.release()
         print(f"🔄 Connecting to RTSP Stream: {self.url}")
         self.cap = cv2.VideoCapture(self.url, cv2.CAP_FFMPEG)
-        
+
     def start(self):
-        # Start a thread to continuously drain the camera's FFMPEG buffer
         threading.Thread(target=self.update, daemon=True).start()
         return self
 
@@ -48,20 +57,17 @@ class RTSPStream:
                 time.sleep(1.0)
                 continue
 
-            # .grab() pulls the raw packet from the network queue but DOES NOT decode it.
             grabbed = self.cap.grab()
             if not grabbed:
                 consecutive_failures += 1
-                # If grabbing fails 10 times consecutively, the stream is dead. Reconnect.
                 if consecutive_failures > 10:
                     print("⚠️ Stream lost! Reconnecting to Tapo...")
                     self.connect()
                     consecutive_failures = 0
                 time.sleep(0.01)
                 continue
-            
+
             consecutive_failures = 0
-            # Every loop, decode only the most recent grabbed packet into a frame
             ret, frame = self.cap.retrieve()
             if ret and frame is not None and frame.size > 0:
                 with self.lock:
@@ -70,7 +76,6 @@ class RTSPStream:
                 time.sleep(0.002)
 
     def read(self):
-        # Safe thread-read of the latest decoded frame
         with self.lock:
             return self.frame.copy() if self.frame is not None else None
 
@@ -78,56 +83,69 @@ class RTSPStream:
         self.stopped = True
         if self.cap is not None:
             self.cap.release()
-        
+
+
 # --- MQTT SETUP ---
 client = mqtt.Client(callback_api_version=mqtt.CallbackAPIVersion.VERSION2)
+mqtt_connected = False
 try:
     client.connect(MQTT_BROKER, 1883, 60)
-    client.loop_start() 
+    client.loop_start()
+    mqtt_connected = True
+    print("✅ MQTT Connected Successfully")
 except Exception as e:
     print(f"❌ MQTT Offline: {e}")
 
-# --- AI INFERENCE THREAD ---
+# --- AI INFERENCE SETUP ---
 print("Loading YOLO model...")
-model = YOLO("yolo11n.pt") 
+model = YOLO("yolo11n.pt")
 
 active_boxes = []
-lock = threading.Lock() # Prevents race conditions between threads
+lock = threading.Lock()
 last_msg_time = 0
-msg_interval = 0.5 
+msg_interval = 0.5
+
 
 def ai_worker(stream_obj):
-    global active_boxes, last_msg_time
-    frame_counter = 0
-    
+    global active_boxes, last_msg_time, ai_status_msg
+
+    print("🚀 AI Worker Thread Active!")
+
     while not stream_obj.stopped:
-        img = stream_obj.read()
-        if img is None:
-            time.sleep(0.01)
-            continue
-            
-        frame_counter += 1
-        # Only run AI on every 2nd available frame to save CPU
-        if frame_counter % 2 != 0:
-            time.sleep(0.01)
-            continue
-            
-        h, w, _ = img.shape
-        left_boundary = w // 3
-        right_boundary = (2 * w) // 3
-        
-        # Run inference
-        results = model(img, size=640, classes=TARGET_CLASSES, verbose=False, device="cpu", stream=True)
-        
-        temp_boxes = []
-        for r in results:
-            for box in r.boxes:
-                if float(box.conf[0]) > 0.25:
-                    class_id = int(box.cls[0])
+        try:
+            img = stream_obj.read()
+            if img is None:
+                time.sleep(0.01)
+                continue
+
+            h, w, _ = img.shape
+            left_boundary = w // 3
+            right_boundary = (2 * w) // 3
+
+            # Run YOLO Detection with lower confidence threshold
+            results = model(
+                img, imgsz=640, verbose=False, device="cpu", conf=0.30
+            )
+
+            temp_boxes = []
+            trash_found_in_frame = False
+            detected_count = 0
+
+            for r in results:
+                if r.boxes is None or len(r.boxes) == 0:
+                    continue
+
+                for box in r.boxes:
+                    class_id = int(box.cls[0].item())
+
+                    # Safe Box Extraction
+                    x1, y1, x2, y2 = (
+                        box.xyxy[0].cpu().numpy().astype(int).tolist()
+                    )
                     item_name = model.names[class_id]
-                    x1, y1, x2, y2 = map(int, box.xyxy[0])
                     obj_center_x = (x1 + x2) // 2
-                    
+
+                    # Zone calculation
                     if obj_center_x < left_boundary:
                         zone, color = "LEFT", (255, 100, 0)
                     elif obj_center_x > right_boundary:
@@ -135,73 +153,169 @@ def ai_worker(stream_obj):
                     else:
                         zone, color = "CENTER", (0, 255, 0)
 
-                    label_type = "TRASH" if class_id in TRASH_IDS else "PERSON"
-                    temp_boxes.append((x1, y1, x2, y2, color, f"{label_type}: {item_name}"))
+                    label_type = (
+                        "TRASH" if class_id in TRASH_IDS else "PERSON/OBJ"
+                    )
+                    temp_boxes.append(
+                        (
+                            x1,
+                            y1,
+                            x2,
+                            y2,
+                            color,
+                            f"{label_type}: {item_name} ({class_id})",
+                        )
+                    )
+                    detected_count += 1
 
+                    # Publish MQTT payload for Trash Items
+                    current_time = time.time()
                     if class_id in TRASH_IDS:
-                        current_time = time.time()
-                        if current_time - last_msg_time >= msg_interval:
+                        trash_found_in_frame = True
+                        if (current_time - last_msg_time) >= msg_interval:
                             payload = json.dumps({"i": item_name, "z": zone})
-                            client.publish(MQTT_TOPIC, payload)
+                            if mqtt_connected:
+                                client.publish(MQTT_TOPIC, payload)
                             last_msg_time = current_time
                             print(f"⏱️ MQTT Sent: {payload}")
-                            
-        # Safely update the global active bounding boxes
-        with lock:
-            active_boxes = temp_boxes
 
-# --- START CAMERA STREAM ---
-USER, PASS, IP = "ARUS2026", "arus_robot", "192.168.0.200" 
+            # Send STOP message if no trash present
+            current_time = time.time()
+            if (
+                not trash_found_in_frame
+                and (current_time - last_msg_time) >= msg_interval
+            ):
+                payload = json.dumps({"i": "none", "z": "STOP"})
+                if mqtt_connected:
+                    client.publish(MQTT_TOPIC, payload)
+                last_msg_time = current_time
+
+            # Update bounding boxes thread-safely
+            with lock:
+                active_boxes = temp_boxes
+                ai_status_msg = f"AI Running - Detected: {detected_count} objs"
+
+            time.sleep(0.01)
+
+        except Exception as e:
+            ai_status_msg = f"AI Error: {e}"
+            print(f"❌ AI Worker Error: {e}")
+            traceback.print_exc()
+            time.sleep(0.5)
+
+
+# --- START STREAM & AI THREAD ---
+USER, PASS, IP = "ARUS2026", "arus_robot", "192.168.0.200"
 url = f"rtsp://{USER}:{PASS}@{IP}:554/stream2"
 stream = RTSPStream(url).start()
-time.sleep(1.0) 
+time.sleep(1.0)
 
-# --- START AI THREAD ---
 ai_thread = threading.Thread(target=ai_worker, args=(stream,), daemon=True)
 ai_thread.start()
 
-# --- MAIN DISPLAY LOOP (Runs at max monitor speed) ---
+# --- FLASK STREAM SETUP ---
+app = Flask(__name__)
+
+
+def generate_mjpeg_frames():
+    global output_frame, frame_lock
+    while True:
+        with frame_lock:
+            if output_frame is None:
+                time.sleep(0.01)
+                continue
+
+            _, jpeg_buffer = cv2.imencode(
+                ".jpg", output_frame, [int(cv2.IMWRITE_JPEG_QUALITY), 75]
+            )
+            frame_bytes = jpeg_buffer.tobytes()
+
+        yield (
+            b"--frame\r\n"
+            b"Content-Type: image/jpeg\r\n\r\n" + frame_bytes + b"\r\n"
+        )
+        time.sleep(0.03)
+
+
+@app.route("/video_feed")
+def video_feed():
+    return Response(
+        generate_mjpeg_frames(),
+        mimetype="multipart/x-mixed-replace; boundary=frame",
+    )
+
+
+flask_thread = threading.Thread(
+    target=lambda: app.run(
+        host="0.0.0.0", port=5000, debug=False, use_reloader=False
+    ),
+    daemon=True,
+)
+flask_thread.start()
+print("🚀 Flask Feed running on http://0.0.0.0:5000/video_feed")
+
+# --- MAIN DISPLAY LOOP ---
 while not stream.stopped:
     display_img = stream.read()
     if display_img is None:
-        # Create a tiny placeholder screen so the UI doesn't crash during network loss
-        import numpy as np
-        loading_frame = np.zeros((int(DISPLAY_WIDTH * 0.75), DISPLAY_WIDTH, 3), dtype=np.uint8)
-        cv2.putText(loading_frame, "Connecting...", (10, int(DISPLAY_WIDTH * 0.35)), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 255), 1)
-        cv2.imshow("ARUS 2026 - Pi Vision", loading_frame)
-        if cv2.waitKey(10) & 0xFF == ord('q'):
-            break
+        time.sleep(0.01)
         continue
 
     h, w, _ = display_img.shape
     left_boundary = w // 3
     right_boundary = (2 * w) // 3
 
-    # Safely pull the boxes drawn by the background AI thread
     with lock:
         boxes_to_draw = list(active_boxes)
+        status_text = str(ai_status_msg)
 
-    for (x1, y1, x2, y2, color, label) in boxes_to_draw:
+    # Render bounding boxes
+    for x1, y1, x2, y2, color, label in boxes_to_draw:
         cv2.rectangle(display_img, (x1, y1), (x2, y2), color, 2)
-        cv2.putText(display_img, label, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+        cv2.putText(
+            display_img,
+            label,
+            (x1, max(y1 - 10, 20)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.5,
+            color,
+            2,
+        )
 
-    cv2.line(display_img, (left_boundary, 0), (left_boundary, h), (200, 200, 200), 2)
-    cv2.line(display_img, (right_boundary, 0), (right_boundary, h), (200, 200, 200), 2)
+    # Render division lines
+    cv2.line(
+        display_img, (left_boundary, 0), (left_boundary, h), (200, 200, 200), 2
+    )
+    cv2.line(
+        display_img,
+        (right_boundary, 0),
+        (right_boundary, h),
+        (200, 200, 200),
+        2,
+    )
 
-    # 👈 DOWNSIZE DISPLAY FRAME HERE
+    # Display AI diagnostic status bar directly on top of the image
+    cv2.putText(
+        display_img,
+        status_text,
+        (10, 30),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.7,
+        (0, 255, 255),
+        2,
+    )
+
     aspect_ratio = h / w
-    display_height = int(DISPLAY_WIDTH * aspect_ratio)
-    resized_display = cv2.resize(display_img, (DISPLAY_WIDTH, display_height))
+    display_height = int(STREAM_WIDTH * aspect_ratio)
+    resized_display = cv2.resize(display_img, (STREAM_WIDTH, display_height))
+
+    with frame_lock:
+        output_frame = resized_display.copy()
 
     cv2.imshow("ARUS 2026 - Pi Vision", resized_display)
-    
-    if cv2.waitKey(1) & 0xFF == ord('q'):
+
+    if cv2.waitKey(1) & 0xFF == ord("q"):
         break
 
 stream.stop()
 cv2.destroyAllWindows()
-try:
-    client.loop_stop()
-    client.disconnect()
-except:
-    pass
